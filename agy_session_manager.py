@@ -25,10 +25,11 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -59,6 +60,15 @@ SUMMARY_COLUMNS = [
     "raw_summary",
     "group_id",
 ]
+
+# Расширения уже сжатых файлов, которые не имеет смысла повторно сжимать через DEFLATE
+ALREADY_COMPRESSED_EXTS: Set[str] = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico",
+    ".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv",
+    ".mp3", ".ogg", ".wav", ".aac", ".flac",
+    ".zip", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".zst",
+    ".whl", ".jar", ".apk", ".pdf"
+}
 
 
 # ---------------------------------------------------------------------------
@@ -121,17 +131,18 @@ def rebuild_agyhub_proto(agy_dir: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Data models & Core Engine
+# Data models & Helpers
 # ---------------------------------------------------------------------------
 
 def format_size(num_bytes: int) -> str:
     if num_bytes < 1024:
         return f"{num_bytes} Б"
+    val = float(num_bytes)
     for unit in ["КБ", "МБ", "ГБ"]:
-        num_bytes /= 1024.0
-        if num_bytes < 1024.0 or unit == "ГБ":
-            return f"{num_bytes:.1f} {unit}"
-    return f"{num_bytes:.1f} ГБ"
+        val /= 1024.0
+        if val < 1024.0 or unit == "ГБ":
+            return f"{val:.1f} {unit}"
+    return f"{val:.1f} ГБ"
 
 
 def dir_size(path: Path) -> int:
@@ -184,6 +195,10 @@ class SessionRecord:
             return "—"
         return self.last_modified_time[:19].replace("T", " ")
 
+
+# ---------------------------------------------------------------------------
+# Core Session Store Engine
+# ---------------------------------------------------------------------------
 
 class AntigravitySessionStore:
     def __init__(self, agy_dir: Path = DEFAULT_AGY_DIR):
@@ -368,10 +383,13 @@ class AntigravitySessionStore:
         include_children: bool = True,
         include_brain: bool = True,
         exclude_browser_sandbox: bool = False,
-        progress_cb: Optional[Callable[[str], None]] = None,
+        progress_cb: Optional[Callable[[str, float, str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         """
         Выгружает выбранные сессии в ZIP-архив (.agysession.zip).
+        Запись выполняется атомарно через временный файл (.part_<pid>), чтобы при прерывании
+        или долгом копировании архив не оставался недописанным и повреждённым.
         """
         all_records: List[SessionRecord] = []
         seen_ids = set()
@@ -399,60 +417,142 @@ class AntigravitySessionStore:
         output_zip = Path(output_zip)
         output_zip.parent.mkdir(parents=True, exist_ok=True)
 
-        with tempfile.TemporaryDirectory(prefix="agy_export_") as tmp_dir_str:
-            tmp_dir = Path(tmp_dir_str)
-            with zipfile.ZipFile(output_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for idx, rec in enumerate(all_records, 1):
-                    cid = rec.conversation_id
-                    if progress_cb:
-                        progress_cb(
-                            f"Экспорт [{idx}/{len(all_records)}]: {rec.display_title}"
-                        )
+        # Атомарный временный файл в том же каталоге
+        tmp_zip = output_zip.with_name(f".{output_zip.name}.part_{os.getpid()}")
+        if tmp_zip.exists():
+            try:
+                tmp_zip.unlink()
+            except OSError:
+                pass
 
-                    manifest["sessions"].append(rec.raw_row)
+        def report(main_title: str, frac: float, detail: str) -> None:
+            if progress_cb:
+                try:
+                    progress_cb(main_title, frac, detail)
+                except Exception:
+                    pass
 
-                    # 1. conversations/<id>.db через sqlite backup API
-                    src_db = self.agy_dir / "conversations" / f"{cid}.db"
-                    if src_db.exists():
-                        tmp_db = tmp_dir / f"{cid}.db"
-                        try:
-                            self._safe_backup_sqlite(src_db, tmp_db)
-                            zf.write(tmp_db, f"conversations/{cid}.db")
-                            tmp_db.unlink(missing_ok=True)
-                        except Exception:
-                            # Fallback на прямое копирование, если база не заблокирована
-                            zf.write(src_db, f"conversations/{cid}.db")
+        # Оценка общего объёма для точного прогресс-бара
+        total_bytes_est = sum(r.db_size + (r.brain_size if include_brain else 0) for r in all_records) or 1
+        processed_bytes = 0
 
-                    # 2. annotations/<id>.pbtxt
-                    src_ann = self.agy_dir / "annotations" / f"{cid}.pbtxt"
-                    if src_ann.exists():
-                        zf.write(src_ann, f"annotations/{cid}.pbtxt")
+        try:
+            with tempfile.TemporaryDirectory(prefix="agy_export_") as tmp_dir_str:
+                tmp_dir = Path(tmp_dir_str)
+                with zipfile.ZipFile(
+                    tmp_zip, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True
+                ) as zf:
+                    for idx, rec in enumerate(all_records, 1):
+                        if cancel_event and cancel_event.is_set():
+                            raise InterruptedError("Выгрузка отменена пользователем.")
 
-                    # 3. chapter_titles/<id>.pb
-                    src_chap = self.agy_dir / "chapter_titles" / f"{cid}.pb"
-                    if src_chap.exists():
-                        zf.write(src_chap, f"chapter_titles/{cid}.pb")
+                        cid = rec.conversation_id
+                        step_header = f"Выгрузка [{idx}/{len(all_records)}]: {rec.display_title}"
+                        frac = min(0.99, processed_bytes / total_bytes_est)
+                        report(step_header, frac, "Подготовка метаданных...")
 
-                    # 4. brain/<id>/
-                    if include_brain:
-                        src_brain = self.agy_dir / "brain" / cid
-                        if src_brain.exists():
-                            for root, _, files in os.walk(src_brain):
-                                for f in files:
-                                    full_path = Path(root) / f
-                                    rel_path = full_path.relative_to(src_brain).as_posix()
-                                    if (
-                                        exclude_browser_sandbox
-                                        and rel_path.startswith("browser_sandbox/")
-                                    ):
-                                        continue
-                                    zf.write(full_path, f"brain/{cid}/{rel_path}")
+                        manifest["sessions"].append(rec.raw_row)
 
-                # Записываем manifest.json
-                manifest_bytes = json.dumps(
-                    manifest, ensure_ascii=False, indent=2
-                ).encode("utf-8")
-                zf.writestr("manifest.json", manifest_bytes)
+                        # 1. conversations/<id>.db через sqlite backup API
+                        src_db = self.agy_dir / "conversations" / f"{cid}.db"
+                        if src_db.exists():
+                            if cancel_event and cancel_event.is_set():
+                                raise InterruptedError("Выгрузка отменена пользователем.")
+                            report(
+                                step_header,
+                                frac,
+                                f"Сжатие базы данных conversations/{cid[:8]}...db ({format_size(rec.db_size)})",
+                            )
+                            tmp_db = tmp_dir / f"{cid}.db"
+                            try:
+                                self._safe_backup_sqlite(src_db, tmp_db)
+                                zf.write(tmp_db, f"conversations/{cid}.db")
+                                tmp_db.unlink(missing_ok=True)
+                            except Exception:
+                                zf.write(src_db, f"conversations/{cid}.db")
+                            processed_bytes += rec.db_size
+
+                        # 2. annotations/<id>.pbtxt
+                        src_ann = self.agy_dir / "annotations" / f"{cid}.pbtxt"
+                        if src_ann.exists():
+                            zf.write(src_ann, f"annotations/{cid}.pbtxt")
+
+                        # 3. chapter_titles/<id>.pb
+                        src_chap = self.agy_dir / "chapter_titles" / f"{cid}.pb"
+                        if src_chap.exists():
+                            zf.write(src_chap, f"chapter_titles/{cid}.pb")
+
+                        # 4. brain/<id>/
+                        if include_brain:
+                            src_brain = self.agy_dir / "brain" / cid
+                            if src_brain.exists():
+                                for root, _, files in os.walk(src_brain):
+                                    for f in files:
+                                        if cancel_event and cancel_event.is_set():
+                                            raise InterruptedError("Выгрузка отменена пользователем.")
+
+                                        full_path = Path(root) / f
+                                        rel_path = full_path.relative_to(src_brain).as_posix()
+                                        if (
+                                            exclude_browser_sandbox
+                                            and rel_path.startswith("browser_sandbox/")
+                                        ):
+                                            continue
+
+                                        try:
+                                            f_sz = full_path.stat().st_size
+                                        except OSError:
+                                            f_sz = 0
+
+                                        # Ускорение: уже сжатые медиа пишем без повторной компрессии DEFLATE
+                                        ext = full_path.suffix.lower()
+                                        comp = (
+                                            zipfile.ZIP_STORED
+                                            if ext in ALREADY_COMPRESSED_EXTS
+                                            else zipfile.ZIP_DEFLATED
+                                        )
+
+                                        frac = min(0.99, processed_bytes / total_bytes_est)
+                                        report(
+                                            step_header,
+                                            frac,
+                                            f"brain/{cid[:8]}…/{rel_path} ({format_size(f_sz)})",
+                                        )
+                                        try:
+                                            zf.write(
+                                                full_path,
+                                                f"brain/{cid}/{rel_path}",
+                                                compress_type=comp,
+                                            )
+                                        except OSError:
+                                            # Файл временно заблокирован другой программой
+                                            pass
+                                        processed_bytes += f_sz
+
+                    # Записываем manifest.json
+                    report("Завершение", 0.99, "Запись manifest.json и закрытие оглавления архива...")
+                    manifest_bytes = json.dumps(
+                        manifest, ensure_ascii=False, indent=2
+                    ).encode("utf-8")
+                    zf.writestr("manifest.json", manifest_bytes)
+
+            # После успешного закрытия архива zf переименовываем временный файл в целевой
+            report("Завершение", 1.0, "Архив успешно сформирован.")
+            if output_zip.exists():
+                try:
+                    output_zip.unlink()
+                except OSError:
+                    pass
+            tmp_zip.replace(output_zip)
+
+        except Exception:
+            # При любой ошибке или отмене удаляем недописанный временный файл
+            if tmp_zip.exists():
+                try:
+                    tmp_zip.unlink()
+                except OSError:
+                    pass
+            raise
 
         return {
             "output_zip": str(output_zip),
@@ -463,14 +563,45 @@ class AntigravitySessionStore:
 
     @staticmethod
     def inspect_archive(archive_path: Path) -> Dict[str, Any]:
-        """Читает manifest.json и список файлов из архива сессии."""
-        with zipfile.ZipFile(archive_path, "r") as zf:
+        """
+        Проверяет целостность архива и читает manifest.json.
+        При ошибках даёт подробные, понятные подсказки на русском языке.
+        """
+        archive_path = Path(archive_path)
+        if not archive_path.exists():
+            raise FileNotFoundError(f"Файл не найден: {archive_path}")
+
+        sz = archive_path.stat().st_size
+        if sz == 0:
+            raise ValueError("Файл архива пуст (размер 0 байт).")
+
+        if not zipfile.is_zipfile(archive_path):
+            with open(archive_path, "rb") as f:
+                head = f.read(4)
+            if head == b"PK\x03\x04":
+                raise ValueError(
+                    f"Файл {archive_path.name} повреждён или недописан (текущий размер: {format_size(sz)}).\n\n"
+                    "Причина: в конце файла отсутствует оглавление ZIP (Central Directory).\n"
+                    "Это происходит, если архив был скопирован до полного окончания выгрузки "
+                    "или если программа была закрыта в процессе записи.\n\n"
+                    "Пожалуйста, повторите выгрузку на исходном ПК и дождитесь появления сообщения «Выгрузка завершена»."
+                )
+            raise ValueError(
+                f"Файл {archive_path.name} не является ZIP-архивом (сигнатура файла не совпадает)."
+            )
+
+        with zipfile.ZipFile(archive_path, "r", allowZip64=True) as zf:
             names = zf.namelist()
             if "manifest.json" not in names:
                 raise ValueError(
-                    "В архиве отсутствует manifest.json (это не архив сессии Antigravity)."
+                    f"В архиве {archive_path.name} отсутствует manifest.json.\n"
+                    "Этот файл не является архивом сессии Antigravity."
                 )
-            manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            try:
+                manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            except Exception as e:
+                raise ValueError(f"Ошибка парсинга manifest.json в архиве: {e}")
+
             total_uncompressed = sum(info.file_size for info in zf.infolist())
             manifest["file_count"] = len(names)
             manifest["total_uncompressed_size"] = total_uncompressed
@@ -482,13 +613,21 @@ class AntigravitySessionStore:
         conflict_mode: str = "overwrite",  # "overwrite" | "skip"
         backup_existing: bool = True,
         reset_running_status: bool = True,
-        progress_cb: Optional[Callable[[str], None]] = None,
+        progress_cb: Optional[Callable[[str, float, str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         """
         Заливает (импортирует) сессии из архива в каталог Antigravity.
         """
         manifest = self.inspect_archive(archive_path)
         sessions_meta: List[Dict[str, Any]] = manifest.get("sessions", [])
+
+        def report(main_title: str, frac: float, detail: str) -> None:
+            if progress_cb:
+                try:
+                    progress_cb(main_title, frac, detail)
+                except Exception:
+                    pass
 
         # Определяем, какие ID уже существуют
         existing_ids = set()
@@ -516,12 +655,15 @@ class AntigravitySessionStore:
             else:
                 to_import_ids.add(cid)
 
-        # Если нужно сделать резервную копию перезаписываемых сессий
+        # Страховочный бэкап перезаписываемых сессий
         backup_zip_path: Optional[Path] = None
         overlapping = to_import_ids.intersection(existing_ids)
         if overlapping and backup_existing:
-            if progress_cb:
-                progress_cb("Создание страховочного бэкапа перезаписываемых сессий...")
+            report(
+                "Резервное копирование",
+                0.05,
+                "Создание страховочного бэкапа перезаписываемых сессий...",
+            )
             all_current = self.list_sessions()
             by_id: Dict[str, SessionRecord] = {}
             for r in all_current:
@@ -541,15 +683,23 @@ class AntigravitySessionStore:
                     include_brain=True,
                 )
 
-        # Распаковка файлов для выбранных сессий
+        # Распаковка файлов
         for subdir in ["conversations", "annotations", "chapter_titles", "brain"]:
             (self.agy_dir / subdir).mkdir(parents=True, exist_ok=True)
 
-        with zipfile.ZipFile(archive_path, "r") as zf:
-            for member in zf.infolist():
+        with zipfile.ZipFile(archive_path, "r", allowZip64=True) as zf:
+            members = [
+                m
+                for m in zf.infolist()
+                if m.filename != "manifest.json" and not m.filename.endswith("/")
+            ]
+            total_members = len(members) or 1
+
+            for idx, member in enumerate(members, 1):
+                if cancel_event and cancel_event.is_set():
+                    raise InterruptedError("Импорт отменён пользователем.")
+
                 name = member.filename
-                if name == "manifest.json" or name.endswith("/"):
-                    continue
                 parts = name.split("/")
                 if len(parts) < 2:
                     continue
@@ -564,7 +714,13 @@ class AntigravitySessionStore:
                 if cid not in to_import_ids:
                     continue
 
-                # Если перезаписываем conversations/<id>.db, удалим старые -wal/-shm, чтобы не конфликтовали
+                frac = 0.10 + 0.80 * (idx / total_members)
+                report(
+                    f"Импорт файлов [{idx}/{total_members}]",
+                    frac,
+                    f"Распаковка: {name}",
+                )
+
                 if top_folder == "conversations":
                     for ext in (".db-wal", ".db-shm"):
                         wal_file = self.agy_dir / "conversations" / f"{cid}{ext}"
@@ -580,9 +736,7 @@ class AntigravitySessionStore:
                     shutil.copyfileobj(src_f, dst_f)
 
         # Обновление conversation_summaries.db
-        if progress_cb:
-            progress_cb("Обновление базы conversation_summaries.db...")
-
+        report("Синхронизация данных", 0.92, "Обновление conversation_summaries.db...")
         conn = sqlite3.connect(str(self.summaries_db))
         try:
             cur = conn.cursor()
@@ -622,7 +776,6 @@ class AntigravitySessionStore:
                 if not cid or cid not in to_import_ids:
                     continue
                 if "last_modified_time" not in s_row:
-                    # Orphan DB row without full summary
                     continue
 
                 row_copy = dict(s_row)
@@ -644,9 +797,13 @@ class AntigravitySessionStore:
             conn.close()
 
         # Пересборка agyhub_summaries_proto.pb
-        if progress_cb:
-            progress_cb("Синхронизация agyhub_summaries_proto.pb...")
+        report(
+            "Синхронизация данных",
+            0.97,
+            "Пересборка индекса agyhub_summaries_proto.pb...",
+        )
         proto_count = rebuild_agyhub_proto(self.agy_dir)
+        report("Завершено", 1.0, f"Импорт завершён успешно ({len(to_import_ids)} сессий).")
 
         return {
             "imported_count": len(to_import_ids),
@@ -719,6 +876,138 @@ class AntigravitySessionStore:
 
 
 # ---------------------------------------------------------------------------
+# Modal Progress Dialog
+# ---------------------------------------------------------------------------
+
+class OperationProgressDialog(tk.Toplevel):
+    """
+    Модальное окно с подробным индикатором выполнения операции,
+    секундомером и защитой от случайного прерывания.
+    """
+
+    def __init__(self, parent: tk.Tk, title: str, header_text: str):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("540x240")
+        self.minsize(480, 220)
+        self.resizable(False, False)
+        self.configure(bg="#0f172a")
+        self.transient(parent)
+        self.grab_set()
+
+        self.cancel_event = threading.Event()
+        self.start_time = time.time()
+        self.is_done = False
+
+        # Центрирование относительно родителя
+        self.update_idletasks()
+        pw = parent.winfo_width()
+        ph = parent.winfo_height()
+        px = parent.winfo_rootx()
+        py = parent.winfo_rooty()
+        x = px + (pw - 540) // 2
+        y = py + (ph - 240) // 2
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        self.lbl_header = ttk.Label(
+            frame,
+            text=header_text,
+            style="Header.TLabel",
+        )
+        self.lbl_header.pack(anchor=tk.W, pady=(0, 6))
+
+        self.lbl_main = ttk.Label(
+            frame,
+            text="Инициализация...",
+            font=("Segoe UI Semibold", 10),
+        )
+        self.lbl_main.pack(anchor=tk.W, pady=(0, 4))
+
+        self.lbl_detail = ttk.Label(
+            frame,
+            text="",
+            style="Muted.TLabel",
+        )
+        self.lbl_detail.pack(anchor=tk.W, pady=(0, 12))
+
+        self.pbar = ttk.Progressbar(
+            frame, orient=tk.HORIZONTAL, mode="determinate", maximum=100
+        )
+        self.pbar.pack(fill=tk.X, pady=(0, 8))
+
+        bottom_bar = ttk.Frame(frame)
+        bottom_bar.pack(fill=tk.X)
+
+        self.lbl_stats = ttk.Label(
+            bottom_bar,
+            text="0% | Прошло: 00:00",
+            style="Muted.TLabel",
+        )
+        self.lbl_stats.pack(side=tk.LEFT)
+
+        self.btn_cancel = ttk.Button(
+            bottom_bar,
+            text="Отмена",
+            style="Secondary.TButton",
+            command=self._on_cancel_click,
+        )
+        self.btn_cancel.pack(side=tk.RIGHT)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close_attempt)
+        self._update_timer()
+
+    def _update_timer(self) -> None:
+        if self.is_done or not self.winfo_exists():
+            return
+        elapsed = int(time.time() - self.start_time)
+        mins, secs = divmod(elapsed, 60)
+        curr_val = self.pbar["value"]
+        self.lbl_stats.configure(
+            text=f"{curr_val:.0f}% | Прошло: {mins:02d}:{secs:02d}"
+        )
+        self.after(500, self._update_timer)
+
+    def update_progress(self, main_title: str, frac: float, detail: str) -> None:
+        if not self.winfo_exists() or self.is_done:
+            return
+        pct = max(0.0, min(100.0, frac * 100.0))
+        self.pbar["value"] = pct
+        self.lbl_main.configure(text=main_title)
+        # Сокращаем путь для отображения
+        if len(detail) > 65:
+            detail = detail[:30] + "…" + detail[-32:]
+        self.lbl_detail.configure(text=detail)
+
+    def finish(self) -> None:
+        self.is_done = True
+        self.pbar["value"] = 100
+        self.lbl_main.configure(text="Завершено!")
+        self.lbl_detail.configure(text="Все операции успешно выполнены.")
+        self.btn_cancel.configure(state=tk.DISABLED)
+        self.destroy()
+
+    def _on_cancel_click(self) -> None:
+        if messagebox.askyesno(
+            "Прерывание",
+            "Вы уверены, что хотите отменить операцию?\n"
+            "Недописанный файл архива будет удалён.",
+            parent=self,
+        ):
+            self.cancel_event.set()
+            self.lbl_main.configure(text="Отмена операции...")
+            self.btn_cancel.configure(state=tk.DISABLED)
+
+    def _on_close_attempt(self) -> None:
+        if self.is_done:
+            self.destroy()
+            return
+        self._on_cancel_click()
+
+
+# ---------------------------------------------------------------------------
 # Modern Tkinter GUI
 # ---------------------------------------------------------------------------
 
@@ -743,7 +1032,7 @@ class SessionManagerGUI(tk.Tk):
         self.store = AntigravitySessionStore(initial_dir)
         self.sessions: List[SessionRecord] = []
         self.filtered_sessions: List[SessionRecord] = []
-        self.checked_ids: set[str] = set()
+        self.checked_ids: Set[str] = set()
 
         self._setup_styles()
         self._build_ui()
@@ -759,7 +1048,7 @@ class SessionManagerGUI(tk.Tk):
         style.configure("TLabel", background=self.BG_MAIN, foreground=self.FG_TEXT)
         style.configure("Card.TLabel", background=self.BG_CARD, foreground=self.FG_TEXT)
         style.configure("Muted.TLabel", background=self.BG_MAIN, foreground=self.FG_MUTED, font=("Segoe UI", 9))
-        style.configure("Header.TLabel", background=self.BG_MAIN, foreground=self.FG_TEXT, font=("Segoe UI Semibold", 14))
+        style.configure("Header.TLabel", background=self.BG_MAIN, foreground=self.FG_TEXT, font=("Segoe UI Semibold", 13))
 
         style.configure(
             "Accent.TButton",
@@ -810,8 +1099,16 @@ class SessionManagerGUI(tk.Tk):
         style.configure("TCheckbutton", background=self.BG_MAIN, foreground=self.FG_TEXT)
         style.map("TCheckbutton", background=[("active", self.BG_MAIN)])
 
+        style.configure(
+            "Horizontal.TProgressbar",
+            background=self.ACCENT,
+            troughcolor=self.BG_CARD,
+            borderwidth=0,
+            thickness=10,
+        )
+
     def _build_ui(self) -> None:
-        # 1. Верхняя панель (путь к Antigravity и глобальные кнопки)
+        # 1. Верхняя панель
         top_bar = ttk.Frame(self, padding=(16, 14, 16, 8))
         top_bar.pack(fill=tk.X)
 
@@ -904,7 +1201,6 @@ class SessionManagerGUI(tk.Tk):
             variable=self.inc_brain_var,
         ).pack(side=tk.LEFT)
 
-        # Кнопки Выгрузки и Заливки справа
         ttk.Button(
             filter_bar,
             text="📥 Залить сессию из архива...",
@@ -919,7 +1215,7 @@ class SessionManagerGUI(tk.Tk):
             command=self._export_selected,
         ).pack(side=tk.RIGHT)
 
-        # 3. Основная рабочая область: таблица слева + детали справа
+        # 3. Основная рабочая область
         paned = tk.PanedWindow(
             self,
             orient=tk.HORIZONTAL,
@@ -1049,7 +1345,6 @@ class SessionManagerGUI(tk.Tk):
             return
 
         self.sessions = self.store.list_sessions()
-        # Оставляем отмеченными только существующие
         valid_ids = {s.conversation_id for s in self.sessions}
         self.checked_ids.intersection_update(valid_ids)
         self._apply_filter()
@@ -1234,6 +1529,13 @@ class SessionManagerGUI(tk.Tk):
         inc_children = self.inc_children_var.get()
         inc_brain = self.inc_brain_var.get()
 
+        # Создаём модальное окно прогресса
+        prog_dlg = OperationProgressDialog(
+            self,
+            title="Выгрузка сессий Antigravity",
+            header_text="📤 Создание архива сессий...",
+        )
+
         def worker() -> None:
             try:
                 res = self.store.export_sessions(
@@ -1241,30 +1543,40 @@ class SessionManagerGUI(tk.Tk):
                     Path(out_path),
                     include_children=inc_children,
                     include_brain=inc_brain,
-                    progress_cb=lambda msg: self.after(
-                        0, lambda m=msg: self.status_var.set(m)
+                    progress_cb=lambda main_t, frac, det: self.after(
+                        0, lambda m=main_t, f=frac, d=det: prog_dlg.update_progress(m, f, d)
                     ),
+                    cancel_event=prog_dlg.cancel_event,
                 )
+                def on_success() -> None:
+                    prog_dlg.finish()
+                    self.status_var.set(
+                        f"✅ Выгружено: {res['root_count']} сессий (всего с сабагентами: {res['total_conversations']}), размер: {format_size(res['archive_size'])}"
+                    )
+                    messagebox.showinfo(
+                        "Выгрузка завершена",
+                        f"Архив успешно сохранён:\n{res['output_zip']}\n\n"
+                        f"Корневых сессий: {res['root_count']}\n"
+                        f"Всего траекторий (с сабагентами): {res['total_conversations']}\n"
+                        f"Итоговый размер архива: {format_size(res['archive_size'])}",
+                    )
+                self.after(0, on_success)
+            except InterruptedError:
                 self.after(
                     0,
                     lambda: (
-                        self.status_var.set(
-                            f"✅ Выгружено сессий: {res['root_count']} (всего с агентами: {res['total_conversations']}), размер: {format_size(res['archive_size'])}"
-                        ),
-                        messagebox.showinfo(
-                            "Выгрузка завершена",
-                            f"Архив успешно сохранён:\n{res['output_zip']}\n\n"
-                            f"Корневых сессий: {res['root_count']}\n"
-                            f"Всего траекторий (с сабагентами): {res['total_conversations']}\n"
-                            f"Размер архива: {format_size(res['archive_size'])}",
-                        ),
+                        prog_dlg.finish(),
+                        self.status_var.set("Выгрузка отменена пользователем."),
                     ),
                 )
             except Exception as exc:
                 self.after(
                     0,
-                    lambda e=exc: messagebox.showerror(
-                        "Ошибка выгрузки", f"Не удалось выгрузить сессии:\n{e}"
+                    lambda e=exc: (
+                        prog_dlg.finish(),
+                        messagebox.showerror(
+                            "Ошибка выгрузки", f"Не удалось выгрузить сессии:\n{e}"
+                        ),
                     ),
                 )
 
@@ -1332,7 +1644,6 @@ class SessionManagerGUI(tk.Tk):
             messagebox.showerror("Ошибка чтения архива", str(exc))
             return
 
-        # Диалог подтверждения и настроек импорта
         dlg = tk.Toplevel(self)
         dlg.title("Заливка (импорт) сессий из архива")
         dlg.geometry("620x460")
@@ -1426,6 +1737,12 @@ class SessionManagerGUI(tk.Tk):
             do_reset = reset_status_var.get()
             dlg.destroy()
 
+            prog_dlg = OperationProgressDialog(
+                self,
+                title="Заливка архива Antigravity",
+                header_text="📥 Заливка сессий в Antigravity...",
+            )
+
             def worker() -> None:
                 try:
                     res = self.store.import_archive(
@@ -1433,11 +1750,13 @@ class SessionManagerGUI(tk.Tk):
                         conflict_mode=mode,
                         backup_existing=do_backup,
                         reset_running_status=do_reset,
-                        progress_cb=lambda msg: self.after(
-                            0, lambda m=msg: self.status_var.set(m)
+                        progress_cb=lambda main_t, frac, det: self.after(
+                            0, lambda m=main_t, f=frac, d=det: prog_dlg.update_progress(m, f, d)
                         ),
+                        cancel_event=prog_dlg.cancel_event,
                     )
                     def on_done() -> None:
+                        prog_dlg.finish()
                         self.refresh_sessions()
                         backup_note = (
                             f"\nСтраховочный бэкап сохранён в:\n{res['backup_zip']}"
@@ -1452,11 +1771,22 @@ class SessionManagerGUI(tk.Tk):
                             f"{backup_note}",
                         )
                     self.after(0, on_done)
+                except InterruptedError:
+                    self.after(
+                        0,
+                        lambda: (
+                            prog_dlg.finish(),
+                            self.status_var.set("Импорт отменён пользователем."),
+                        ),
+                    )
                 except Exception as exc:
                     self.after(
                         0,
-                        lambda e=exc: messagebox.showerror(
-                            "Ошибка импорта", f"Не удалось залить архив:\n{e}"
+                        lambda e=exc: (
+                            prog_dlg.finish(),
+                            messagebox.showerror(
+                                "Ошибка импорта", f"Не удалось залить архив:\n{e}"
+                            ),
                         ),
                     )
 
@@ -1504,7 +1834,7 @@ def run_cli(args: argparse.Namespace) -> int:
                 s
                 for s in sessions
                 if s.conversation_id in wanted
-                or any( s.conversation_id.startswith(w) for w in wanted )
+                or any(s.conversation_id.startswith(w) for w in wanted)
             ]
         if not targets:
             print("Не найдено подходящих сессий для выгрузки.", file=sys.stderr)
@@ -1516,7 +1846,7 @@ def run_cli(args: argparse.Namespace) -> int:
             out_path,
             include_children=not args.no_children,
             include_brain=not args.no_brain,
-            progress_cb=lambda m: print(m),
+            progress_cb=lambda main_t, frac, det: print(f"[{frac*100:5.1f}%] {main_t} -> {det}"),
         )
         print(
             f"\nГотово! Выгружено {res['root_count']} корневых сессий (всего {res['total_conversations']}) -> {res['output_zip']} ({format_size(res['archive_size'])})"
@@ -1528,7 +1858,7 @@ def run_cli(args: argparse.Namespace) -> int:
             Path(args.archive),
             conflict_mode="skip" if args.skip_existing else "overwrite",
             backup_existing=not args.no_backup,
-            progress_cb=lambda m: print(m),
+            progress_cb=lambda main_t, frac, det: print(f"[{frac*100:5.1f}%] {main_t} -> {det}"),
         )
         print(
             f"\nГотово! Импортировано: {res['imported_count']}, пропущено: {res['skipped_count']}, индекс обновлён ({res['proto_synced_count']} записей)."
